@@ -185,9 +185,9 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		}
 		h.upstream = upstreamURL
 
-		if !isLocalhost(h.upstream.Hostname()) && h.upstream.Scheme != "https" {
-			return errors.New("insecure schemes are only allowed to localhost upstreams")
-		}
+		// if !isLocalhost(h.upstream.Hostname()) && h.upstream.Scheme != "https" {
+		// 	return errors.New("insecure schemes are only allowed to localhost upstreams")
+		// }
 
 		registerHTTPDialer := func(u *url.URL, _ proxy.Dialer) (proxy.Dialer, error) {
 			// CONNECT request is proxied as-is, so we don't care about target url, but it could be
