@@ -26,7 +26,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
