@@ -644,7 +644,7 @@ func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Wri
 		buf := *bufPtr
 		buf = buf[0:cap(buf)]
 		_, _err := flushingIoCopy(w, r, buf, paddingType)
-		bufferPool.Put(bufPtr)
+		bufferPool.Put(buf)
 
 		if cw, ok := w.(closeWriter); ok {
 			_ = cw.CloseWrite()
