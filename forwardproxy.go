@@ -294,8 +294,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		// HTTP CONNECT Fast Open. We merely close the connection if Open fails.
 		wFlusher, ok := w.(http.Flusher)
 		if !ok {
-			return caddyhttp.Error(http.StatusInternalServerError,
-				fmt.Errorf("ResponseWriter doesn't implement http.Flusher"))
+			h.logger.Info("ResponseWriter doesn't implement http.Flusher")
+			// return caddyhttp.Error(http.StatusInternalServerError,
+			// 	fmt.Errorf("ResponseWriter doesn't implement http.Flusher"))
 		}
 		// Creates a padding of [30, 30+32)
 		paddingLen := rand.Intn(32) + 30
