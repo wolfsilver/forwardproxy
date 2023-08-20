@@ -292,25 +292,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 
 		// HTTP CONNECT Fast Open. We merely close the connection if Open fails.
-		wFlusher, ok := w.(http.Flusher)
-		if ok {
-			// return caddyhttp.Error(http.StatusInternalServerError,
-			// 	fmt.Errorf("ResponseWriter doesn't implement http.Flusher"))
-			// Creates a padding of [30, 30+32)
-			paddingLen := rand.Intn(32) + 30
-			padding := make([]byte, paddingLen)
-			bits := rand.Uint64()
-			for i := 0; i < 16; i++ {
-				// Codes that won't be Huffman coded.
-				padding[i] = "!#$()+<>?@[]^`{}"[bits&15]
-				bits >>= 4
-			}
-			for i := 16; i < paddingLen; i++ {
-				padding[i] = '~'
-			}
-			w.Header().Set("Padding", string(padding))
-			w.WriteHeader(http.StatusOK)
-			wFlusher.Flush()
+		// return caddyhttp.Error(http.StatusInternalServerError,
+		// 	fmt.Errorf("ResponseWriter doesn't implement http.Flusher"))
+		// Creates a padding of [30, 30+32)
+		paddingLen := rand.Intn(32) + 30
+		padding := make([]byte, paddingLen)
+		bits := rand.Uint64()
+		for i := 0; i < 16; i++ {
+			// Codes that won't be Huffman coded.
+			padding[i] = "!#$()+<>?@[]^`{}"[bits&15]
+			bits >>= 4
+		}
+		for i := 16; i < paddingLen; i++ {
+			padding[i] = '~'
+		}
+		w.Header().Set("Padding", string(padding))
+		w.WriteHeader(http.StatusOK)
+		err := http.NewResponseController(w).Flush()
+		if err != nil {
+			return caddyhttp.Error(http.StatusInternalServerError, fmt.Errorf(err.Error()))
 		}
 
 		hostPort := r.URL.Host
