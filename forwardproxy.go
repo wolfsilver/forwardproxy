@@ -36,6 +36,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	caddy "github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -47,10 +48,6 @@ import (
 
 func init() {
 	caddy.RegisterModule(Handler{})
-
-	// Used for generating padding lengths. Not needed to be cryptographically secure.
-	// Does not care about double seeding.
-	rand.Seed(time.Now().UnixNano())
 }
 
 // Handler implements a forward proxy.
@@ -96,10 +93,7 @@ type Handler struct {
 	aclRules []aclRule
 
 	// TODO: temporary/deprecated - we should try to reuse existing authentication modules instead!
-	BasicauthUser   string `json:"auth_user_deprecated,omitempty"`
-	BasicauthPass   string `json:"auth_pass_deprecated,omitempty"`
-	authRequired    bool
-	authCredentials [][]byte // slice with base64-encoded credentials
+	AuthCredentials [][]byte `json:"auth_credentials,omitempty"` // slice with base64-encoded credentials
 }
 
 // CaddyModule returns the Caddy module information.
@@ -123,14 +117,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		MaxIdleConns:        50,
 		IdleConnTimeout:     60 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
-	}
-
-	// TODO: temporary, in an effort to get the tests to pass
-	if h.BasicauthUser != "" && h.BasicauthPass != "" {
-		basicAuthBuf := make([]byte, base64.StdEncoding.EncodedLen(len(h.BasicauthUser)+1+len(h.BasicauthPass)))
-		base64.StdEncoding.Encode(basicAuthBuf, []byte(h.BasicauthUser+":"+h.BasicauthPass))
-		h.authRequired = true
-		h.authCredentials = [][]byte{basicAuthBuf}
 	}
 
 	// access control lists
@@ -160,7 +146,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	h.aclRules = append(h.aclRules, &aclAllRule{allow: true})
 
 	if h.ProbeResistance != nil {
-		if !h.authRequired {
+		if h.AuthCredentials == nil {
 			return fmt.Errorf("probe resistance requires authentication")
 		}
 		if len(h.ProbeResistance.Domain) > 0 {
@@ -242,7 +228,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	var authErr error
-	if h.authRequired {
+	if h.AuthCredentials != nil {
 		authErr = h.checkCredentials(r)
 	}
 	if h.ProbeResistance != nil && len(h.ProbeResistance.Domain) > 0 && reqHost == h.ProbeResistance.Domain {
@@ -291,13 +277,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			}
 		}
 
-		// HTTP CONNECT Fast Open. We merely close the connection if Open fails.
-		wFlusher, ok := w.(http.Flusher)
-		if !ok {
-			return caddyhttp.Error(http.StatusInternalServerError,
-				fmt.Errorf("ResponseWriter doesn't implement http.Flusher"))
-		}
-		// Creates a padding of [30, 30+32)
+		// HTTP CONNECT Fast Open: Directly responds with a 200 OK
+		// before attempting to connect to origin to reduce response latency.
+		// We merely close the connection if Open fails.
+
+		// Creates a padding header with length in [30, 30+32)
 		paddingLen := rand.Intn(32) + 30
 		padding := make([]byte, paddingLen)
 		bits := rand.Uint64()
@@ -310,8 +294,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			padding[i] = '~'
 		}
 		w.Header().Set("Padding", string(padding))
+
 		w.WriteHeader(http.StatusOK)
-		wFlusher.Flush()
+		err := http.NewResponseController(w).Flush()
+		if err != nil {
+			return caddyhttp.Error(http.StatusInternalServerError,
+				fmt.Errorf("ResponseWriter flush error: %v", err))
+		}
 
 		hostPort := r.URL.Host
 		if hostPort == "" {
@@ -385,7 +374,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			}
 			r.Body, _ = r.GetBody()
 		}
-		response, _ = h.httpTransport.RoundTrip(r)
+		response, err = h.httpTransport.RoundTrip(r)
 	} else {
 		// Upstream requests don't interact well with Transport: connections could always be
 		// reused, but Transport thinks they go to different Hosts, so it spawns tons of
@@ -414,7 +403,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				fmt.Errorf("failed to read upstream response: %v", err))
 		}
 	}
-	err = r.Body.Close()
+	if err := r.Body.Close(); err != nil {
+		return caddyhttp.Error(http.StatusBadGateway,
+			fmt.Errorf("failed to close response body: %v", err))
+	}
 
 	if response != nil {
 		defer response.Body.Close()
@@ -438,13 +430,36 @@ func (h Handler) checkCredentials(r *http.Request) error {
 	if strings.ToLower(pa[0]) != "basic" {
 		return errors.New("auth type is not supported")
 	}
-	for _, creds := range h.authCredentials {
+	for _, creds := range h.AuthCredentials {
 		if subtle.ConstantTimeCompare(creds, []byte(pa[1])) == 1 {
+			repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+			buf := make([]byte, base64.StdEncoding.DecodedLen(len(creds)))
+			_, _ = base64.StdEncoding.Decode(buf, creds) // should not err ever since we are decoding a known good input
+			cred := string(buf)
+			repl.Set("http.auth.user.id", cred[:strings.IndexByte(cred, ':')])
 			// Please do not consider this to be timing-attack-safe code. Simple equality is almost
 			// mindlessly substituted with constant time algo and there ARE known issues with this code,
 			// e.g. size of smallest credentials is guessable. TODO: protect from all the attacks! Hash?
 			return nil
 		}
+	}
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	buf := make([]byte, base64.StdEncoding.DecodedLen(len([]byte(pa[1]))))
+	n, err := base64.StdEncoding.Decode(buf, []byte(pa[1]))
+	if err != nil {
+		repl.Set("http.auth.user.id", "invalidbase64:"+err.Error())
+		return err
+	}
+	if utf8.Valid(buf[:n]) {
+		cred := string(buf[:n])
+		i := strings.IndexByte(cred, ':')
+		if i >= 0 {
+			repl.Set("http.auth.user.id", "invalid:"+cred[:i])
+		} else {
+			repl.Set("http.auth.user.id", "invalidformat:"+cred)
+		}
+	} else {
+		repl.Set("http.auth.user.id", "invalid::")
 	}
 	return errors.New("invalid credentials")
 }
@@ -578,12 +593,7 @@ func serveHiddenPage(w http.ResponseWriter, authErr error) error {
 // Hijacks the connection from ResponseWriter, writes the response and proxies data between targetConn
 // and hijacked connection.
 func serveHijack(w http.ResponseWriter, targetConn net.Conn) error {
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		return caddyhttp.Error(http.StatusInternalServerError,
-			fmt.Errorf("ResponseWriter does not implement http.Hijacker"))
-	}
-	clientConn, bufReader, err := hijacker.Hijack()
+	clientConn, bufReader, err := http.NewResponseController(w).Hijack()
 	if err != nil {
 		return caddyhttp.Error(http.StatusInternalServerError,
 			fmt.Errorf("hijack failed: %v", err))
@@ -644,7 +654,7 @@ func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Wri
 		buf := *bufPtr
 		buf = buf[0:cap(buf)]
 		_, _err := flushingIoCopy(w, r, buf, paddingType)
-		bufferPool.Put(buf)
+		bufferPool.Put(bufPtr)
 
 		if cw, ok := w.(closeWriter); ok {
 			_ = cw.CloseWrite()
@@ -654,10 +664,9 @@ func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Wri
 	if padding {
 		go stream(target, clientReader, RemovePadding)
 		return stream(clientWriter, target, AddPadding)
-	} else {
-		go stream(target, clientReader, NoPadding)  //nolint: errcheck
-		return stream(clientWriter, target, NoPadding)
 	}
+	go stream(target, clientReader, NoPadding) //nolint: errcheck
+	return stream(clientWriter, target, NoPadding)
 }
 
 type closeWriter interface {
@@ -668,7 +677,11 @@ type closeWriter interface {
 // If dst does not implement http.Flusher(e.g. net.TCPConn), it will do a simple io.CopyBuffer().
 // Reasoning: http2ResponseWriter will not flush on its own, so we have to do it manually.
 func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, paddingType int) (written int64, err error) {
-	flusher, hasFlusher := dst.(http.Flusher)
+	rw, ok := dst.(http.ResponseWriter)
+	var rc *http.ResponseController
+	if ok {
+		rc = http.NewResponseController(rw)
+	}
 	var numPadding int
 	for {
 		var nr int
@@ -704,15 +717,19 @@ func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, paddingType int) (
 		}
 		if nr > 0 {
 			nw, ew := dst.Write(buf[0:nr])
-			if hasFlusher {
-				flusher.Flush()
-			}
 			if nw > 0 {
 				written += int64(nw)
 			}
 			if ew != nil {
 				err = ew
 				break
+			}
+			if rc != nil {
+				ef := rc.Flush()
+				if ef != nil {
+					err = ef
+					break
+				}
 			}
 			if nr != nw {
 				err = io.ErrShortWrite
